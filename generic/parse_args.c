@@ -34,7 +34,7 @@ static int GetEnumChoicesFromObj(Tcl_Interp* interp, Tcl_Obj* obj, char*** res)
 	Tcl_ObjIntRep*	ir = Tcl_FetchIntRep(obj, &enum_choices_type);
 
 	if (ir == NULL) {
-		const char**	table;
+		char**		table;
 		int				len;
 		Tcl_ObjIntRep	newir;
 
