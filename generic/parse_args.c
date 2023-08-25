@@ -1171,6 +1171,9 @@ finally:
 }
 
 //}}}
+#ifdef WIN32
+extern DLLEXPORT
+#endif
 int Parse_args_SafeInit(Tcl_Interp* interp) //{{{
 {
 	// No unsafe features
