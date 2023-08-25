@@ -19,7 +19,7 @@ dnl	to configure the system for the local environment.
 # so that we create the export library with the dll.
 #-----------------------------------------------------------------------
 
-AC_INIT([parse_args], [0.3.3])
+AC_INIT([parse_args], [0.5.1])
 
 #--------------------------------------------------------------------
 # Call TEA_INIT as the first TEA_ macro to set up initial vars.
@@ -144,6 +144,7 @@ TEA_CONFIG_CFLAGS
 
 # Check for required polyfill
 TIP445
+TEABASE_INIT()
 
 #--------------------------------------------------------------------
 # Set the default compiler switches based on the --enable-symbols option.
@@ -188,4 +189,4 @@ AC_CONFIG_FILES([Makefile pkgIndex.tcl])
 # specified with AC_CONFIG_FILES.
 #--------------------------------------------------------------------
 
-AC_OUTPUT()
+AC_OUTPUT

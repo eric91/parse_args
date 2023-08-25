@@ -22,15 +22,15 @@ static void free_enum_choices_intrep(Tcl_Obj* obj)
 {
 	Tcl_ObjIntRep*		ir = Tcl_FetchIntRep(obj, &enum_choices_type);
 
-	if (ir->otherValuePtr) {
-		ckfree(ir->otherValuePtr);
-		ir->otherValuePtr = NULL;
+	if (ir->twoPtrValue.ptr1) {
+		ckfree(ir->twoPtrValue.ptr1);
+		ir->twoPtrValue.ptr1 = NULL;
 	}
 }
 
 static int GetEnumChoicesFromObj(Tcl_Interp* interp, Tcl_Obj* obj, char*** res)
 {
-	int				code = TCL_OK;
+	int					code = TCL_OK;
 	Tcl_ObjIntRep*	ir = Tcl_FetchIntRep(obj, &enum_choices_type);
 
 	if (ir == NULL) {
@@ -40,13 +40,12 @@ static int GetEnumChoicesFromObj(Tcl_Interp* interp, Tcl_Obj* obj, char*** res)
 
 		TEST_OK_LABEL(finally, code, Tcl_SplitList(interp, Tcl_GetString(obj), &len, &table));
 
-		newir.otherValuePtr = table;
-		Tcl_FreeIntRep(obj);
+		newir.twoPtrValue.ptr1 = table;
 		Tcl_StoreIntRep(obj, &enum_choices_type, &newir);
 		ir = Tcl_FetchIntRep(obj, &enum_choices_type);
 	}
 
-	*res = (char**)ir->otherValuePtr;
+	*res = (char**)ir->twoPtrValue.ptr1;
 
 finally:
 	return code;
@@ -70,6 +69,7 @@ static const char* static_str[] = {
 	"default",
 	"validate",
 	"choices",
+	"all",
 	NULL
 };
 enum static_objs {
@@ -80,6 +80,7 @@ enum static_objs {
 	L_DEFAULT,
 	L_VALIDATE,
 	L_CHOICES,
+	L_ALL,
 	L_end
 };
 
@@ -97,10 +98,12 @@ struct parse_spec {
 	int						positional_arg_count;
 	struct option_info*		multi;
 	int						multi_count;
+	Tcl_Obj**				all;
+	int						all_count;
 };
 
 struct option_info {
-	int			arg_count;	// -1: store the option name in -name if present
+	int			arg_count;	// -1: store the option name in -name if present; -2: comsume all remaining args
 	int			supplied;
 	int			is_args;	// args style processing - consume all remaining arguments
 	int			required;
@@ -112,8 +115,87 @@ struct option_info {
 	Tcl_Obj*	enum_choices;	// NULL if not an enum, also stores multi_choices for a multi
 	Tcl_Obj*	comment;		// NULL if no comment
 	int			alias;			// boolean
+	int			all_idx;		// >= 0 - collect all instances of this option as a list, accumulated in a list at this index
+	int			end_options;	// boolean.  Treat seeing this option as if -- followed immediately after it
 };
 
+// Fast unsigned int to string conversion from the talk by Alexandrescu: "Three Optimization Tips for C++" {{{
+uint32_t digits10(uint64_t v) //{{{
+{
+#define P01	10
+#define P02	100
+#define P03	1000
+#define P04	10000
+#define P05	100000
+#define P06	1000000
+#define P07	10000000
+#define P08	100000000
+#define P09	1000000000
+#define P10	10000000000
+#define P11	100000000000
+#define P12	1000000000000
+	if (v < P01) return 1;
+	if (v < P02) return 2;
+	if (v < P03) return 3;
+	if (v < P12) {
+		if (v < P08) {
+			if (v < P06) {
+				if (v < P04) return 4;
+				return 5 + (v >= P05);
+			}
+			return 7 + (v >= P07);
+		}
+		if (v < P10) {
+			return 9 + (v >= P09);
+		}
+		return 11 + (v >= P11);
+	}
+	return 12 + digits10(v / P12);
+}
+
+//}}}
+int u64toa(uint64_t value, char* restrict dst) //{{{
+{
+	// TODO: benchmark this against TclFormatInt and replace the latter with this if it's faster
+	static const char digits[201] =
+		"0001020304050607080910111213141516171819"
+		"2021222324252627282930313233343536373839"
+		"4041424344454647484950515253545556575859"
+		"6061626364656667686970717273747576777879"
+		"8081828384858687888990919293949596979899";
+	const uint32_t length = digits10(value);
+	uint32_t next = length-1;
+
+	while (value >= 100) {
+		const int i = (value % 100) * 2;
+		value /= 100;
+		memcpy(dst+next-1, digits+i, 2);
+		//dst[next] = digits[i+1];
+		//dst[next-1] = digits[i];
+		next -= 2;
+	}
+	if (value < 10) {
+		dst[next] = '0' + (uint32_t)value;
+	} else {
+		const int i = (uint32_t)value * 2;
+		memcpy(dst+next-1, digits+i, 2);
+		//dst[next] = digits[i + 1];
+		//dst[next-1] = digits[i];
+	}
+
+	return length;
+}
+
+//}}}
+//}}}
+static const char* static_numstr(uint64_t v) //{{{
+{
+	static char	staticbuf[21];		// 21 - max length of decimal representation of uint64_t + null terminator
+	staticbuf[u64toa(v, staticbuf)] = 0;
+	return staticbuf;
+}
+
+//}}}
 static void free_option_info(struct option_info* option) //{{{
 {
 	if (option) {
@@ -171,6 +253,12 @@ static void free_parse_spec(struct parse_spec** specPtr) //{{{
 			spec->multi = NULL;
 		}
 
+		if (spec->all) {
+			for (i=0; i < spec->all_count; i++)
+				replace_tclobj(spec->all+i, NULL);
+			ckfree(spec->all);
+		}
+
 		ckfree(spec);
 		*specPtr = NULL;
 	}
@@ -181,16 +269,16 @@ static void free_internal_rep(Tcl_Obj* obj) //{{{
 {
 	Tcl_ObjIntRep*	ir = Tcl_FetchIntRep(obj, &parse_spec_type);
 
-	free_parse_spec((struct parse_spec**)&ir->otherValuePtr);
+	free_parse_spec((struct parse_spec**)&ir->twoPtrValue.ptr1);
 }
 
 //}}}
 static void dup_internal_rep(Tcl_Obj* src, Tcl_Obj* dest) // This shouldn't actually ever be called I think {{{
 {
-	Tcl_ObjIntRep*		ir = Tcl_FetchIntRep(src, &parse_spec_type);
-	Tcl_ObjIntRep		newir;
+	Tcl_ObjIntRep*	ir = Tcl_FetchIntRep(src, &parse_spec_type);
+	Tcl_ObjIntRep	newir;
 	struct parse_spec*	spec = (struct parse_spec*)ckalloc(sizeof(struct parse_spec));
-	struct parse_spec*	old =  (struct parse_spec*)ir->otherValuePtr;
+	struct parse_spec*	old =  (struct parse_spec*)ir->twoPtrValue.ptr1;
 	int		i;
 
 	//fprintf(stderr, "in dup_internal_rep\n");
@@ -237,7 +325,7 @@ static void dup_internal_rep(Tcl_Obj* src, Tcl_Obj* dest) // This shouldn't actu
 		INCREF_OPTION(spec->multi[i]);
 	}
 
-	newir.otherValuePtr = spec;
+	newir.twoPtrValue.ptr1 = spec;
 	Tcl_StoreIntRep(dest, &parse_spec_type, &newir);
 }
 
@@ -262,6 +350,8 @@ static int compile_parse_spec(Tcl_Interp* interp, Tcl_Obj* obj, struct parse_spe
 		"-#",
 		"-multi",
 		"-alias",
+		"-all",
+		"-end",
 		(char*)NULL
 	};
 	enum {
@@ -274,7 +364,9 @@ static int compile_parse_spec(Tcl_Interp* interp, Tcl_Obj* obj, struct parse_spe
 		SETTING_ENUM,
 		SETTING_COMMENT,
 		SETTING_MULTI,
-		SETTING_ALIAS
+		SETTING_ALIAS,
+		SETTING_ALL,
+		SETTING_END
 	};
 	Tcl_DictSearch	search;
 	Tcl_Obj*		multis = NULL;
@@ -309,6 +401,7 @@ static int compile_parse_spec(Tcl_Interp* interp, Tcl_Obj* obj, struct parse_spe
 
 	for (i=0; i<oc; i+=2) {
 		struct option_info*	option;
+		int					all_specified = 0;
 
 		name = ov[i];
 		str = Tcl_GetStringFromObj(name, &str_len);
@@ -328,6 +421,7 @@ static int compile_parse_spec(Tcl_Interp* interp, Tcl_Obj* obj, struct parse_spe
 		Tcl_IncrRefCount(option->param = name);
 		option->arg_count = 1;
 		option->multi_idx = -1;
+		option->all_idx = -1;
 
 		TEST_OK_LABEL(err, code, Tcl_ListObjGetElements(interp, ov[i+1], &settingc, &settingv));
 		j = 0;
@@ -374,9 +468,14 @@ static int compile_parse_spec(Tcl_Interp* interp, Tcl_Obj* obj, struct parse_spe
 					option->arg_count = 0;
 					break;
 				case SETTING_ARGS:
-					TEST_OK_LABEL(err, code, Tcl_GetIntFromObj(interp, settingv[j++], &option->arg_count));
-					if (option->arg_count < 0)
-						THROW_ERROR_LABEL(err, code, "-args cannot be negative");
+					if (strcmp("all", Tcl_GetString(settingv[j])) == 0) {
+						option->arg_count = -2;
+					} else {
+						TEST_OK_LABEL(err, code, Tcl_GetIntFromObj(interp, settingv[j], &option->arg_count));
+						if (option->arg_count < 0)
+							THROW_ERROR_LABEL(err, code, "-args cannot be negative");
+					}
+					j++;
 					break;
 				case SETTING_ENUM:
 					{
@@ -396,12 +495,8 @@ static int compile_parse_spec(Tcl_Interp* interp, Tcl_Obj* obj, struct parse_spe
 						TEST_OK_LABEL(err, code, Tcl_DictObjGet(interp, l->enums, enum_choices, &shared_enum_choices));
 
 						if (shared_enum_choices == NULL) {
-							if (Tcl_IsShared(l->enums)) {
-								Tcl_Obj*	tmp = NULL;
-								replace_tclobj(&tmp, Tcl_DuplicateObj(l->enums));
-								replace_tclobj(&l->enums, tmp);
-								replace_tclobj(&tmp, NULL);
-							}
+							if (Tcl_IsShared(l->enums))
+								replace_tclobj(&l->enums, Tcl_DuplicateObj(l->enums));
 
 							TEST_OK_LABEL(err, code, Tcl_DictObjPut(interp, l->enums, enum_choices, shared_enum_choices = enum_choices));
 						}
@@ -428,6 +523,12 @@ static int compile_parse_spec(Tcl_Interp* interp, Tcl_Obj* obj, struct parse_spe
 				case SETTING_ALIAS:
 					option->alias = 1;
 					break;
+				case SETTING_ALL:
+					all_specified = 1;	// Just raise a flag here to prevent multiple -all specs from excessively incrementing all_count
+					break;
+				case SETTING_END:
+					option->end_options = 1;
+					break;
 				default:
 					{
 						char	buf[3*sizeof(index)+2];
@@ -451,6 +552,7 @@ static int compile_parse_spec(Tcl_Interp* interp, Tcl_Obj* obj, struct parse_spe
 			const char*	multi_val;
 			int			multi_val_len;
 			Tcl_Obj*	multi_config_loan = NULL;
+			Tcl_Obj*	multi_all = NULL;
 
 			//fprintf(stderr, "multis: %s\n", Tcl_GetString(multis));
 			TEST_OK_LABEL(err, code, Tcl_DictObjGet(interp, multis, option->name, &multi_config_loan));
@@ -482,9 +584,25 @@ static int compile_parse_spec(Tcl_Interp* interp, Tcl_Obj* obj, struct parse_spe
 			if (option->validator != NULL)
 				TEST_OK_LABEL(err, code, Tcl_DictObjPut(interp, multi_config_loan, l->obj[L_VALIDATE], option->validator));
 
+			TEST_OK_LABEL(err, code, Tcl_DictObjGet(interp, multi_config_loan, l->obj[L_ALL], &multi_all));
+			if (all_specified || multi_all) {
+				int all_idx;
+				if (multi_all) {
+					TEST_OK_LABEL(err, code, Tcl_GetIntFromObj(interp, multi_all, &all_idx));
+				} else {
+					all_idx = spec->all_count++;
+				}
+				option->all_idx = all_idx;
+				if (!multi_all)
+					TEST_OK_LABEL(err, code, Tcl_DictObjPut(interp, multi_config_loan, l->obj[L_ALL], Tcl_NewIntObj(all_idx)));
+			}
+
+
 			// Repurpose option->default_val to store the value this option will set in the multi output
 			multi_val = Tcl_GetStringFromObj(option->param, &multi_val_len);
 			replace_tclobj(&option->default_val, Tcl_NewStringObj(multi_val+1, multi_val_len-1));
+		} else if (all_specified) {
+			option->all_idx = spec->all_count++;
 		}
 	}
 
@@ -530,6 +648,13 @@ static int compile_parse_spec(Tcl_Interp* interp, Tcl_Obj* obj, struct parse_spe
 			// set multi choices (for error message if required and not set)
 			TEST_OK_LABEL(err_search, code, Tcl_DictObjGet(interp, multi_config_loan, l->obj[L_CHOICES],  &val));
 			replace_tclobj(&multi->enum_choices, val);
+
+			TEST_OK_LABEL(err_search, code, Tcl_DictObjGet(interp, multi_config_loan, l->obj[L_ALL],  &val));
+			if (val) {
+				TEST_OK_LABEL(err_search, code, Tcl_GetIntFromObj(interp, val, &multi->all_idx));
+			} else {
+				multi->all_idx = -1;
+			}
 		}
 		Tcl_DictObjDone(&search);
 	}
@@ -561,6 +686,12 @@ static int compile_parse_spec(Tcl_Interp* interp, Tcl_Obj* obj, struct parse_spe
 		// TODO: better usage_msg
 		replace_tclobj(&spec->usage_msg, Tcl_NewStringObj("?-option ...?", -1));
 	}
+
+	if (spec->all_count) {
+		spec->all = ckalloc(sizeof(Tcl_Obj*) * spec->all_count);
+		memset(spec->all, 0, sizeof(Tcl_Obj*) * spec->all_count);
+	}
+
 	*res = spec;
 
 	goto finally;
@@ -581,23 +712,22 @@ finally:
 
 static int GetParseSpecFromObj(Tcl_Interp* interp, Tcl_Obj* spec, struct parse_spec** res) //{{{
 {
-	int				code = TCL_OK;
+	int					code = TCL_OK;
 	Tcl_ObjIntRep*	ir = Tcl_FetchIntRep(spec, &parse_spec_type);
 
 	if (ir == NULL) {
-		Tcl_ObjIntRep		newir;
+		Tcl_ObjIntRep	newir;
 		struct parse_spec*	compiled_spec = NULL;
 
 		TEST_OK_LABEL(finally, code, compile_parse_spec(interp, spec, &compiled_spec));
 
-		newir.otherValuePtr = compiled_spec;
-		Tcl_FreeIntRep(spec);
+		newir.twoPtrValue.ptr1 = compiled_spec;
 		Tcl_StoreIntRep(spec, &parse_spec_type, &newir);
 		ir = Tcl_FetchIntRep(spec, &parse_spec_type);
 	}
 
 	if (res)
-		*res = (struct parse_spec*)ir->otherValuePtr;
+		*res = (struct parse_spec*)ir->twoPtrValue.ptr1;
 
 finally:
 	return code;
@@ -684,8 +814,34 @@ static int validate(Tcl_Interp* interp, struct option_info* option, Tcl_Obj* val
 }
 
 //}}}
+static inline int _put_option_value(Tcl_Interp* interp, Tcl_Obj* res, struct parse_spec* spec, struct option_info* option, Tcl_Obj* val, int dictmode) //{{{
+{
+	int			code = TCL_OK;
+	const int	all_idx = option->all_idx;
+
+	if (all_idx >= 0) {
+		if (spec->all[all_idx] == NULL)
+			replace_tclobj(&spec->all[all_idx], Tcl_NewListObj(1, NULL));
+		TEST_OK_LABEL(finally, code, Tcl_ListObjAppendElement(interp, spec->all[all_idx], val));
+	} else {
+		if (dictmode) {
+			TEST_OK_LABEL(finally, code, Tcl_DictObjPut(interp, res, option->name, val));
+		} else {
+			if (Tcl_ObjSetVar2(interp, option->name, NULL, val, TCL_LEAVE_ERR_MSG) == NULL) {
+				code = TCL_ERROR;
+				goto finally;
+			}
+		}
+	}
+
+finally:
+	return code;
+}
+
+//}}}
 static int parse_args(ClientData cdata, Tcl_Interp* interp, int objc, Tcl_Obj *const objv[]) //{{{
 {
+	int			code = TCL_OK;
 	struct interp_cx*	l = (struct interp_cx*)cdata;
 	Tcl_Obj**	av;
 	int			ac, i, check_options=1, positional_arg=0;
@@ -696,31 +852,41 @@ static int parse_args(ClientData cdata, Tcl_Interp* interp, int objc, Tcl_Obj *c
 
 	if (objc < 3 || objc > 4) {
 		Tcl_WrongNumArgs(interp, 1, objv, "args args_spec ?dict?");
-		return TCL_ERROR;
+		code = TCL_ERROR;
+		goto finally;
 	}
 
-	TEST_OK(Tcl_ListObjGetElements(interp, objv[1], &ac, &av));
+	TEST_OK_LABEL(finally, code, Tcl_ListObjGetElements(interp, objv[1], &ac, &av));
 	//fprintf(stderr, "Getting parse_spec from (%s)\n", Tcl_GetString(objv[2]));
-	TEST_OK(GetParseSpecFromObj(interp, objv[2], &spec));
+	TEST_OK_LABEL(finally, code, GetParseSpecFromObj(interp, objv[2], &spec));
 
 	for (i=0; i<spec->option_count; i++)
 		spec->option[i].supplied = 0;
 	for (i=0; i<spec->multi_count; i++)
 		spec->multi[i].supplied = 0;
+	for (i=0; i<spec->all_count; i++)
+		replace_tclobj(spec->all+i, NULL);
 
 	if (dictmode)
-		res = Tcl_NewDictObj();
+		replace_tclobj(&res, Tcl_NewDictObj());
 
-#define OUTPUT(name, val) \
-	if (dictmode) { \
-		TEST_OK(Tcl_DictObjPut(interp, res, (name), (val))); \
-	} else { \
-		if (Tcl_ObjSetVar2(interp, (name), NULL, (val), TCL_LEAVE_ERR_MSG) == NULL) return TCL_ERROR; \
-	}
+#define OUTPUT(option, val) 	TEST_OK_LABEL(finally, code, _put_option_value(interp, res, spec, option, val, dictmode))
+
+#define OUTPUT_DIRECT(name, val) \
+	do { \
+		if (dictmode) { \
+			TEST_OK_LABEL(finally, code, Tcl_DictObjPut(interp, res, (name), (val))); \
+		} else { \
+			if (Tcl_ObjSetVar2(interp, (name), NULL, (val), TCL_LEAVE_ERR_MSG) == NULL) { \
+				code = TCL_ERROR; \
+				goto finally; \
+			} \
+		} \
+	} while(0)
 
 #define VALIDATE(option, val) \
 	if ((option)->validator != NULL || (option)->enum_choices != NULL) { \
-		TEST_OK(validate(interp, (option), (val))); \
+		TEST_OK_LABEL(finally, code, validate(interp, (option), (val))); \
 	}
 
 	for (i=0; i<ac; i++) {
@@ -742,7 +908,7 @@ static int parse_args(ClientData cdata, Tcl_Interp* interp, int objc, Tcl_Obj *c
 					continue;
 				}
 
-				TEST_OK(Tcl_GetIndexFromObj(interp, av[i], spec->options, "option", TCL_EXACT, &index));
+				TEST_OK_LABEL(finally, code, Tcl_GetIndexFromObj(interp, av[i], spec->options, "option", TCL_EXACT, &index));
 				option = src_option = &spec->option[index];
 				if (option->multi_idx >= 0)
 					option = &spec->multi[src_option->multi_idx];
@@ -760,29 +926,39 @@ static int parse_args(ClientData cdata, Tcl_Interp* interp, int objc, Tcl_Obj *c
 							Tcl_GetString(option->name), option->arg_count));
 					}
 					Tcl_SetErrorCode(interp, "PARSE_ARGS", "ARGUMENT", "MISSING", Tcl_GetString(option->name), NULL);
-					return TCL_ERROR;
+					code = TCL_ERROR;
+					goto finally;
 				}
 
 				switch (option->arg_count) {
+					case -2:
+						// All remaining args
+						i++;
+						val = Tcl_NewListObj(ac-i, av+i);
+						VALIDATE(option, val);
+						OUTPUT(option, val);
+						i += ac-i;
+						break;
+
 					case -1:
-						OUTPUT(option->name, src_option->default_val);
+						OUTPUT(option, src_option->default_val);
 						break;
 
 					case 0:
-						OUTPUT(option->name, l->obj[L_TRUE]);
+						OUTPUT(option, l->obj[L_TRUE]);
 						break;
 
 					case 1:
 						val = av[++i];
 						VALIDATE(option, val);
 						if (option->alias == 0) {
-							OUTPUT(option->name, val);
+							OUTPUT(option, val);
 						} else {
 							if (dictmode) {
 								// TODO: fetch the value from the variable called option->name in the parent callframe
-								THROW_ERROR("-alias is not yet supported in dictionary mode");
+								THROW_ERROR_LABEL(finally, code, "-alias is not yet supported in dictionary mode");
 							} else {
-								TEST_OK(Tcl_UpVar(interp, "1", Tcl_GetString(val), Tcl_GetString(option->name), 0));
+								TEST_OK_LABEL(finally, code, Tcl_UpVar(interp, "1", Tcl_GetString(val), Tcl_GetString(option->name), 0));
 							}
 						}
 						break;
@@ -790,10 +966,13 @@ static int parse_args(ClientData cdata, Tcl_Interp* interp, int objc, Tcl_Obj *c
 					default:
 						val = Tcl_NewListObj(option->arg_count, av+i+1);
 						VALIDATE(option, val);
-						OUTPUT(option->name, val);
+						OUTPUT(option, val);
 						i += option->arg_count;
 						break;
 				}
+
+				if (option->end_options)
+					check_options = 0;
 
 				continue;
 			} else {
@@ -806,24 +985,36 @@ static int parse_args(ClientData cdata, Tcl_Interp* interp, int objc, Tcl_Obj *c
 			Tcl_AppendResult(interp, "wrong # args: should be \"",
 				Tcl_GetString(spec->usage_msg), "\"", NULL);
 			Tcl_SetErrorCode(interp, "PARSE_ARGS", "WRONGARGS", NULL);
-			return TCL_ERROR;
+			code = TCL_ERROR;
+			goto finally;
 		}
 
-		if (spec->positional[positional_arg].is_args) {
+		if (spec->positional[positional_arg].is_args || spec->positional[positional_arg].arg_count == -2) {
 			val = Tcl_NewListObj(ac-i, av+i);
 			VALIDATE(&spec->positional[positional_arg], val);
-			OUTPUT(spec->positional[positional_arg].name, val);
+			OUTPUT_DIRECT(spec->positional[positional_arg].name, val);
 			i = ac;
+		} else if (spec->positional[positional_arg].arg_count > 1) {
+			const int arg_count	= spec->positional[positional_arg].arg_count;
+			if (arg_count > 0 && ac - i - 1 < arg_count) {
+				// This arg requires arg_count args and not enough remain
+				Tcl_SetErrorCode(interp, "PARSE_ARGS", "WRONGARGS", Tcl_GetString(spec->positional[positional_arg].name), NULL);
+				THROW_ERROR_LABEL(finally, code, "Expecting ", static_numstr(arg_count), " arguments for ", Tcl_GetString(spec->positional[positional_arg].name));
+			}
+			val = Tcl_NewListObj(arg_count, av+i);
+			VALIDATE(&spec->positional[positional_arg], val);
+			OUTPUT_DIRECT(spec->positional[positional_arg].name, val);
+			i += arg_count-1;	// -1: the for loop will increment by 1
 		} else {
 			VALIDATE(&spec->positional[positional_arg], av[i]);
 			if (spec->positional[positional_arg].alias == 0) {
-				OUTPUT(spec->positional[positional_arg].name, av[i]);
+				OUTPUT_DIRECT(spec->positional[positional_arg].name, av[i]);
 			} else {
 				if (dictmode) {
 					// TODO: fetch the value from the variable called option->name in the parent callframe
-					THROW_ERROR("-alias is not yet supported in dictionary mode");
+					THROW_ERROR_LABEL(finally, code, "-alias is not yet supported in dictionary mode");
 				} else {
-					TEST_OK(Tcl_UpVar(interp, "1", Tcl_GetString(av[i]), Tcl_GetString(spec->positional[positional_arg].name), 0));
+					TEST_OK_LABEL(finally, code, Tcl_UpVar(interp, "1", Tcl_GetString(av[i]), Tcl_GetString(spec->positional[positional_arg].name), 0));
 				}
 			}
 		}
@@ -831,21 +1022,29 @@ static int parse_args(ClientData cdata, Tcl_Interp* interp, int objc, Tcl_Obj *c
 		positional_arg++;
 	}
 
-	// Check -required and set -default for options that weren't specified
+	// Check -required, set -default for options that weren't specified, and set the -all lists
 	for (i=0; i < spec->option_count; i++) {
 		struct option_info* option = &spec->option[i];
+
+		if (option->all_idx >= 0) {
+			const int	all_idx = option->all_idx;
+			if (spec->all[all_idx]) {
+				OUTPUT_DIRECT(option->name, spec->all[all_idx]);
+				replace_tclobj(spec->all + all_idx, NULL);
+			}
+		}
 
 		if (option->supplied) continue;
 		if (option->multi_idx >= 0) continue;
 
 		if (option->default_val != NULL) {
-			OUTPUT(option->name, option->default_val);
+			OUTPUT_DIRECT(option->name, option->default_val);
 		} else if (option->arg_count == 0) {
-			OUTPUT(option->name, l->obj[L_FALSE]);
+			OUTPUT_DIRECT(option->name, l->obj[L_FALSE]);
 		} else {
 			if (option->required) {
 				Tcl_SetErrorCode(interp, "PARSE_ARGS", "REQUIRED", Tcl_GetString(option->param), NULL);
-				THROW_ERROR("option ", Tcl_GetString(option->param), " is required");
+				THROW_ERROR_LABEL(finally, code, "option ", Tcl_GetString(option->param), " is required");
 			}
 		}
 	}
@@ -859,10 +1058,10 @@ static int parse_args(ClientData cdata, Tcl_Interp* interp, int objc, Tcl_Obj *c
 		if (option->supplied) continue;
 
 		if (option->default_val != NULL) {
-			OUTPUT(option->name, option->default_val);
+			OUTPUT(option, option->default_val);
 		} else if (option->required) {
 			Tcl_SetErrorCode(interp, "PARSE_ARGS", "REQUIRED_ONE_OF", Tcl_GetString(option->enum_choices), NULL);
-			THROW_ERROR("one of ", Tcl_GetString(option->enum_choices), " are required");
+			THROW_ERROR_LABEL(finally, code, "one of ", Tcl_GetString(option->enum_choices), " are required");
 		}
 	}
 
@@ -874,26 +1073,36 @@ static int parse_args(ClientData cdata, Tcl_Interp* interp, int objc, Tcl_Obj *c
 			// Don't need to validate here - the default was baked in at
 			// definition time and it might be useful to allow it to be outside
 			// the valid domain
-			OUTPUT(option->name, option->default_val);
+			OUTPUT_DIRECT(option->name, option->default_val);
 		} else {
 			// Missing some positional args
 			if (option->required) {
 				Tcl_SetErrorCode(interp, "PARSE_ARGS", "REQUIRED", Tcl_GetString(option->param), NULL);
-				THROW_ERROR("argument ", Tcl_GetString(option->name), " is required");
+				THROW_ERROR_LABEL(finally, code, "argument ", Tcl_GetString(option->name), " is required");
 			}
 		}
 	}
 
-	if (dictmode)
-		if (Tcl_ObjSetVar2(interp, objv[3], NULL, res, TCL_LEAVE_ERR_MSG) == NULL)
-			return TCL_ERROR;
+	if (dictmode) {
+		if (Tcl_ObjSetVar2(interp, objv[3], NULL, res, TCL_LEAVE_ERR_MSG) == NULL) {
+			code = TCL_ERROR;
+			goto finally;
+		}
+	}
 
-	return TCL_OK;
+finally:
+	if (spec)
+		for (i=0; i<spec->all_count; i++)
+			replace_tclobj(spec->all + i, NULL);
+
+	replace_tclobj(&res, NULL);
+
+	return code;
 }
 
 //}}}
 
-static void free_interp_cx(ClientData cdata, Tcl_Interp* interp) //<<<
+static void free_interp_cx(ClientData cdata, Tcl_Interp* interp) //{{{
 {
 	struct interp_cx*	l = (struct interp_cx*)cdata;
 	int					i;
@@ -909,7 +1118,7 @@ static void free_interp_cx(ClientData cdata, Tcl_Interp* interp) //<<<
 	}
 }
 
-//>>>
+//}}}
 
 #ifdef WIN32
 extern DLLEXPORT
