@@ -535,7 +535,10 @@ static int compile_parse_spec(Tcl_Interp* interp, Tcl_Obj* obj, struct parse_spe
 	}
 
 	if (spec->positional_arg_count > 0) {
-		struct option_info*	last = &spec->positional[spec->positional_arg_count - 1];
+		struct option_info *last = &spec->positional[spec->positional_arg_count - 1];
+		struct option_info *opt;
+		Tcl_Obj *usage_msg;
+		int i;
 		// Create special "args" behaviour for last positional param named "args"
 		// strcmp is safe because Tcl_GetString always gives us a properly
 		// \0 terminated string
@@ -544,11 +547,20 @@ static int compile_parse_spec(Tcl_Interp* interp, Tcl_Obj* obj, struct parse_spe
 			if (last->default_val == NULL)
 				replace_tclobj(&last->default_val, Tcl_NewObj());
 		}
+		usage_msg = Tcl_NewStringObj("?-option ...?", -1);
+		for (i=0; i<spec->positional_arg_count; i++) {
+			opt = &spec->positional[i];
+			if (opt->is_args)
+				Tcl_AppendStringsToObj(usage_msg, " ?arg ...?", NULL);
+			else
+				Tcl_AppendStringsToObj(usage_msg, " ", Tcl_GetString(opt->param), NULL);
+		}
+		// TODO: better usage_msg
+		replace_tclobj(&spec->usage_msg, usage_msg);
+	} else {
+		// TODO: better usage_msg
+		replace_tclobj(&spec->usage_msg, Tcl_NewStringObj("?-option ...?", -1));
 	}
-
-	// TODO: better usage_msg
-	replace_tclobj(&spec->usage_msg, Tcl_ObjPrintf("Invalid args, should be ?-option ...? %s", "?arg ...?"));
-
 	*res = spec;
 
 	goto finally;
@@ -740,7 +752,14 @@ static int parse_args(ClientData cdata, Tcl_Interp* interp, int objc, Tcl_Obj *c
 				//		Tcl_GetString(option->name), option->arg_count);
 				if (option->arg_count > 0 && ac - i - 1 < option->arg_count) {
 					// This option requires args and not enough remain
-					Tcl_WrongNumArgs(interp, 1, objv, Tcl_GetString(spec->usage_msg));
+					if (option->arg_count == 1) {
+						Tcl_AppendResult(interp, "missing value for option \"",
+							Tcl_GetString(option->name), "\"", NULL);
+					} else { 
+						Tcl_SetObjResult(interp, Tcl_ObjPrintf("option \"%s\" requires %d values",
+							Tcl_GetString(option->name), option->arg_count));
+					}
+					Tcl_SetErrorCode(interp, "PARSE_ARGS", "ARGUMENT", "MISSING", Tcl_GetString(option->name), NULL);
 					return TCL_ERROR;
 				}
 
@@ -784,7 +803,9 @@ static int parse_args(ClientData cdata, Tcl_Interp* interp, int objc, Tcl_Obj *c
 
 		if (positional_arg >= spec->positional_arg_count) {
 			// Too many positional args
-			Tcl_WrongNumArgs(interp, 1, objv, Tcl_GetString(spec->usage_msg));
+			Tcl_AppendResult(interp, "wrong # args: should be \"",
+				Tcl_GetString(spec->usage_msg), "\"", NULL);
+			Tcl_SetErrorCode(interp, "PARSE_ARGS", "WRONGARGS", NULL);
 			return TCL_ERROR;
 		}
 
